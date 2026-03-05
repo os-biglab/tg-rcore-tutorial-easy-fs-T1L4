@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use spin::{Mutex, MutexGuard};
 /// Virtual filesystem layer over easy-fs
 pub struct Inode {
+    inode_id: u32,
     block_id: usize,
     block_offset: usize,
     fs: Arc<Mutex<EasyFileSystem>>,
@@ -17,12 +18,14 @@ pub struct Inode {
 impl Inode {
     /// Create a vfs inode
     pub fn new(
+        inode_id: u32,
         block_id: u32,
         block_offset: usize,
         fs: Arc<Mutex<EasyFileSystem>>,
         block_device: Arc<dyn BlockDevice>,
     ) -> Self {
         Self {
+            inode_id,
             block_id: block_id as usize,
             block_offset,
             fs,
@@ -70,6 +73,7 @@ impl Inode {
             self.find_inode_id(name, disk_inode).map(|inode_id| {
                 let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
                 Arc::new(Self::new(
+                    inode_id,
                     block_id,
                     block_offset,
                     self.fs.clone(),
@@ -131,6 +135,7 @@ impl Inode {
         block_cache_sync_all();
         // 4) 返回新文件的 Inode 句柄
         Some(Arc::new(Self::new(
+            new_inode_id,
             block_id,
             block_offset,
             self.fs.clone(),
@@ -186,5 +191,110 @@ impl Inode {
             }
         });
         block_cache_sync_all();
+    }
+
+    /// 获取 inode 编号。
+    pub fn inode_id(&self) -> u32 {
+        self.inode_id
+    }
+
+    /// 获取 inode 元信息（是否目录、硬链接计数）。
+    pub fn metadata(&self) -> (bool, u32) {
+        self.read_disk_inode(|disk_inode| (disk_inode.is_dir(), disk_inode.nlink))
+    }
+
+    /// 在当前目录中为 `src` 创建一个新名称 `dst` 的硬链接。
+    pub fn link(&self, src: &str, dst: &str) -> isize {
+        if src == dst {
+            return -1;
+        }
+
+        let mut fs = self.fs.lock();
+        let src_inode = self.read_disk_inode(|disk_inode| {
+            self.find_inode_id(src, disk_inode).filter(|_| self.find_inode_id(dst, disk_inode).is_none())
+        });
+        let Some(src_inode_id) = src_inode else {
+            return -1;
+        };
+
+        self.modify_disk_inode(|root_inode| {
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            let dirent = DirEntry::new(dst, src_inode_id);
+            root_inode.write_at(file_count * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+        });
+
+        let (block_id, block_offset) = fs.get_disk_inode_pos(src_inode_id);
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |inode: &mut DiskInode| {
+                inode.nlink += 1;
+            });
+
+        block_cache_sync_all();
+        0
+    }
+
+    /// 删除当前目录中的一个硬链接。
+    pub fn unlink(&self, name: &str) -> isize {
+        let mut fs = self.fs.lock();
+        let mut removed_inode = None;
+        let mut kept_entries: Vec<DirEntry> = Vec::new();
+
+        self.read_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            let mut dirent = DirEntry::empty();
+            for i in 0..file_count {
+                assert_eq!(
+                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ,
+                );
+                if dirent.name() == name {
+                    removed_inode = Some(dirent.inode_number());
+                } else {
+                    kept_entries.push(DirEntry::new(dirent.name(), dirent.inode_number()));
+                }
+            }
+        });
+
+        let Some(removed_inode_id) = removed_inode else {
+            return -1;
+        };
+
+        self.modify_disk_inode(|root_inode| {
+            let data_blocks_dealloc = root_inode.clear_size(&self.block_device);
+            for data_block in data_blocks_dealloc {
+                fs.dealloc_data(data_block);
+            }
+
+            for (idx, dirent) in kept_entries.iter().enumerate() {
+                let new_size = (idx + 1) * DIRENT_SZ;
+                self.increase_size(new_size as u32, root_inode, &mut fs);
+                root_inode.write_at(idx * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+            }
+        });
+
+        let (block_id, block_offset) = fs.get_disk_inode_pos(removed_inode_id);
+        let mut should_dealloc_inode = false;
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |inode: &mut DiskInode| {
+                inode.nlink -= 1;
+                if inode.nlink == 0 {
+                    let data_blocks_dealloc = inode.clear_size(&self.block_device);
+                    for data_block in data_blocks_dealloc {
+                        fs.dealloc_data(data_block);
+                    }
+                    should_dealloc_inode = true;
+                }
+            });
+
+        if should_dealloc_inode {
+            fs.dealloc_inode(removed_inode_id);
+        }
+
+        block_cache_sync_all();
+        0
     }
 }
