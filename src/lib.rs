@@ -9,6 +9,7 @@
 //! - 再看 `efs.rs`：理解文件系统创建/打开流程；
 //! - 最后看 `vfs.rs`：理解 inode 级别读写与目录操作接口。
 
+#![allow(non_snake_case)]
 #![no_std]
 #![deny(warnings, missing_docs)]
 extern crate alloc;
