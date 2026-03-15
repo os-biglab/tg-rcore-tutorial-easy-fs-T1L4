@@ -1,7 +1,7 @@
 [package]
 name = "tg-rcore-tutorial-easy-fs-T1L4"
 description = "ch6 T1L4. A simple filesystem implementation for rCore tutorial OS."
-version = "0.0.1-preview.1"
+version = "0.0.1-preview.2"
 edition = "2024"
 authors = ["Yifan Wu <shinbokuow@163.com>"]
 repository = "https://github.com/os-biglab/tg-rcore-tutorial-easy-fs-T1L4"
